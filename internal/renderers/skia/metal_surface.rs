@@ -5,7 +5,11 @@ use i_slint_core::api::{PhysicalSize as PhysicalWindowSize, Window};
 use i_slint_core::graphics::RequestedGraphicsAPI;
 use i_slint_core::partial_renderer::DirtyRegion;
 use objc2::rc::autoreleasepool;
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    rc::Retained,
+    runtime::{NSObjectProtocol, ProtocolObject},
+    sel,
+};
 use objc2_core_foundation::CGSize;
 use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLPixelFormat, MTLTexture};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
@@ -55,6 +59,12 @@ pub struct MetalSurface {
     // Map from drawable texture to age. Per https://developer.apple.com/documentation/quartzcore/cametallayer/maximumdrawablecount, CAMetalLayer
     // can have either 2 or 3 drawables, but not more. That way, this vector is bound in growth.
     drawable_ages: RefCell<Vec<(objc2_metal::MTLResourceID, u8)>>,
+}
+
+fn drawable_texture_id(
+    texture: &ProtocolObject<dyn MTLTexture>,
+) -> Option<objc2_metal::MTLResourceID> {
+    texture.respondsToSelector(sel!(gpuResourceID)).then(|| texture.gpuResourceID())
 }
 
 impl super::Surface for MetalSurface {
@@ -184,8 +194,8 @@ impl super::Surface for MetalSurface {
             };
 
             let texture: Retained<ProtocolObject<dyn MTLTexture>> = drawable.texture();
-            let texture_id = texture.gpuResourceID();
-            let age = {
+            let texture_id = drawable_texture_id(&texture);
+            let age = texture_id.map_or(0, |texture_id| {
                 let mut drawables = self.drawable_ages.borrow_mut();
                 if let Some(existing_age) =
                     drawables.iter().find_map(|(id, age)| (*id == texture_id).then_some(*age))
@@ -195,7 +205,7 @@ impl super::Surface for MetalSurface {
                     drawables.push((texture_id, 0));
                     0
                 }
-            };
+            });
             callback(surface.canvas(), Some(gr_context), age);
 
             drop(surface);
@@ -212,18 +222,20 @@ impl super::Surface for MetalSurface {
             command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
             command_buffer.commit();
 
-            self.drawable_ages.borrow_mut().retain_mut(|(id, age)| {
-                if *id == texture_id {
-                    *age = 1;
-                } else {
-                    let Some(new_age) = age.checked_add(1) else {
-                        // texture became too old, remove it.
-                        return false;
-                    };
-                    *age = new_age;
-                }
-                true
-            });
+            if let Some(texture_id) = texture_id {
+                self.drawable_ages.borrow_mut().retain_mut(|(id, age)| {
+                    if *id == texture_id {
+                        *age = 1;
+                    } else {
+                        let Some(new_age) = age.checked_add(1) else {
+                            // texture became too old, remove it.
+                            return false;
+                        };
+                        *age = new_age;
+                    }
+                    true
+                });
+            }
 
             Ok(())
         })
